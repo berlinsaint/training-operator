@@ -1,0 +1,45 @@
+matrix:
+  include:
+    - REPO_DEV: hub.iflytek.com/aipaas/training-operator
+
+pipeline:
+  publish_dev:
+    image: plugins/docker
+    registry: hub.iflytek.com
+    secrets: [docker_username, docker_password]
+    repo: ${REPO_DEV}
+    tags: ${DRONE_BUILD_NUMBER}
+    dockerfile: Dockerfile
+    insecure: true
+    add_host: artifacts.iflytek.com:10.103.57.100
+    when:
+      event: [ push,tag]
+      branch:
+        - master
+
+
+  publish_test:
+    image: plugins/docker
+    registry: hub.iflytek.com
+    secrets: [docker_username, docker_password]
+    repo: ${REPO_DEV}
+    tags: ${DRONE_COMMIT}
+    dockerfile: Dockerfile
+    insecure: true
+    when:
+      event: [ push,tag ]
+      branch:
+        - test
+
+  publish_release:
+    image: plugins/docker
+    registry: hub.iflytek.com
+    secrets: [docker_username, docker_password]
+    repo: ${REPO_DEV}
+    tags: ${DRONE_COMMIT}
+    dockerfile: Dockerfile
+    insecure: true
+    when:
+      event: [ push,tag ]
+      branch:
+        - release*
