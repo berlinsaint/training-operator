@@ -2,7 +2,6 @@
 # only so we exclude them.
 bin/
 /tf-operator
-vendor/
 testbin/*
 cover.out
 
