@@ -9,7 +9,7 @@ pipeline:
     secrets: [docker_username, docker_password]
     repo: ${REPO_DEV}
     tags: ${DRONE_BUILD_NUMBER}
-    dockerfile: Dockerfile
+    dockerfile: build/images/training-operator/Dockerfile
     insecure: true
     add_host: artifacts.iflytek.com:10.103.57.100
     when:
@@ -37,7 +37,7 @@ pipeline:
     secrets: [docker_username, docker_password]
     repo: ${REPO_DEV}
     tags: ${DRONE_COMMIT}
-    dockerfile: Dockerfile
+    dockerfile: build/images/training-operator/Dockerfile
     insecure: true
     when:
       event: [ push,tag ]
