@@ -17,11 +17,19 @@ package tensorflow
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/cache"
+	"reflect"
+	"sort"
+
+	"github.com/kubeflow/common/pkg/util/k8sutil"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"strconv"
 	"strings"
 	"time"
-
-	"k8s.io/client-go/informers"
+	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	"github.com/go-logr/logr"
 	commonv1 "github.com/kubeflow/common/pkg/apis/common/v1"
@@ -44,6 +52,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/informers"
 	kubeclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,7 +67,20 @@ import (
 	volcanoclient "volcano.sh/apis/pkg/client/clientset/versioned"
 )
 
+var (
+	KeyFunc                       = cache.DeletionHandlingMetaNamespaceKeyFunc
+	succeededServiceCreationCount = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "succeeded_tfjob_service_creation_total",
+		Help: "The total number of succeeded service creation",
+	})
+	failedServiceCreationCount = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "failed_tfjob_service_creation_total",
+		Help: "The total number of failed service creation",
+	})
+)
+
 const (
+
 	// tfJobSucceededReason is added in a tfjob when it is succeeded.
 	tfJobSucceededReason = "TFJobSucceeded"
 	// tfJobRunningReason is added in a tfjob when it is running.
@@ -135,11 +157,395 @@ type TFJobReconciler struct {
 	Log      logr.Logger
 }
 
+// recordAbnormalPods records the active pod whose latest condition is not in True status.
+func (r *TFJobReconciler) recordAbnormalPods(activePods []*v1.Pod, object runtime.Object) {
+	for _, pod := range activePods {
+		// If the pod starts running, should checks the container statuses rather than the conditions.
+		recordContainerStatus := func(status *v1.ContainerStatus) {
+			if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
+				terminated := status.State.Terminated
+				r.Recorder.Eventf(object, v1.EventTypeWarning, terminated.Reason,
+					"Error pod %s container %s exitCode: %d terminated message: %s",
+					pod.Name, status.Name, terminated.ExitCode, terminated.Message)
+			}
+			// The terminated state and waiting state don't simultaneously exists, checks them at the same time.
+			if status.State.Waiting != nil && status.State.Waiting.Message != "" {
+				wait := status.State.Waiting
+				r.Recorder.Eventf(object, v1.EventTypeWarning, wait.Reason,
+					"Error pod %s container %s waiting message: %s", pod.Name, status.Name, wait.Message)
+			}
+		}
+		if len(pod.Status.ContainerStatuses) != 0 {
+			for _, status := range pod.Status.ContainerStatuses {
+				recordContainerStatus(&status)
+			}
+			// If the pod has container status info, that means the init container statuses are normal.
+			continue
+		}
+		if len(pod.Status.InitContainerStatuses) != 0 {
+			for _, status := range pod.Status.InitContainerStatuses {
+				recordContainerStatus(&status)
+			}
+			continue
+		}
+		if len(pod.Status.Conditions) == 0 {
+			continue
+		}
+		// Should not modify the original pod which is stored in the informer cache.
+		status := pod.Status.DeepCopy()
+		sort.Slice(status.Conditions, func(i, j int) bool {
+			return status.Conditions[i].LastTransitionTime.After(status.Conditions[j].LastTransitionTime.Time)
+		})
+		condition := status.Conditions[0]
+		if condition.Status == v1.ConditionTrue {
+			continue
+		}
+		r.Recorder.Eventf(object, v1.EventTypeWarning, condition.Reason, "Error pod %s condition message: %s", pod.Name, condition.Message)
+	}
+}
+
 //+kubebuilder:rbac:groups=kubeflow.org,resources=tfjobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=kubeflow.org,resources=tfjobs/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=kubeflow.org,resources=tfjobs/finalizers,verbs=update
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;delete
+
+// ReconcileJobs checks and updates replicas for each given ReplicaSpec.
+// It will requeue the job in case of an error while creating/deleting pods/services.
+func (r *TFJobReconciler) ReconcileJobs(
+	job interface{},
+	replicas map[commonv1.ReplicaType]*commonv1.ReplicaSpec,
+	jobStatus commonv1.JobStatus,
+	runPolicy *commonv1.RunPolicy) error {
+
+	metaObject, ok := job.(metav1.Object)
+	jobName := metaObject.GetName()
+	if !ok {
+		return fmt.Errorf("job is not of type metav1.Object")
+	}
+	runtimeObject, ok := job.(runtime.Object)
+	if !ok {
+		return fmt.Errorf("job is not of type runtime.Object")
+	}
+	jobKey, err := KeyFunc(job)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for job object %#v: %v", job, err))
+		return err
+	}
+	// Reset expectations
+	// 1. Since `ReconcileJobs` is called, we expect that previous expectations are all satisfied,
+	//    and it's safe to reset the expectations
+	// 2. Reset expectations can avoid dirty data such as `expectedDeletion = -1`
+	//    (pod or service was deleted unexpectedly)
+	r.ResetExpectations(jobKey, replicas)
+
+	logrus.Infof("Reconciling for job %s", metaObject.GetName())
+	pods, err := r.Controller.GetPodsForJob(job)
+	if err != nil {
+		logrus.Warnf("GetPodsForJob error %v", err)
+		return err
+	}
+
+	services, err := r.Controller.GetServicesForJob(job)
+	if err != nil {
+		logrus.Warnf("GetServicesForJob error %v", err)
+		return err
+	}
+
+	oldStatus := jobStatus.DeepCopy()
+	if commonutil.IsSucceeded(jobStatus) || commonutil.IsFailed(jobStatus) {
+		// If the Job is succeed or failed, delete all pods and services.
+		if err := r.DeletePodsAndServices(runPolicy, job, pods); err != nil {
+			return err
+		}
+
+		if err := r.CleanupJob(runPolicy, jobStatus, job); err != nil {
+			return err
+		}
+
+		if r.Config.EnableGangScheduling {
+			r.Recorder.Event(runtimeObject, v1.EventTypeNormal, "JobTerminated", "Job has been terminated. Deleting PodGroup")
+			if err := r.DeletePodGroup(metaObject); err != nil {
+				r.Recorder.Eventf(runtimeObject, v1.EventTypeWarning, "FailedDeletePodGroup", "Error deleting: %v", err)
+				return err
+			} else {
+				r.Recorder.Eventf(runtimeObject, v1.EventTypeNormal, "SuccessfulDeletePodGroup", "Deleted PodGroup: %v", jobName)
+			}
+		}
+
+		// At this point the pods may have been deleted.
+		// 1) If the job succeeded, we manually set the replica status.
+		// 2) If any replicas are still active, set their status to succeeded.
+		if commonutil.IsSucceeded(jobStatus) {
+			for rtype := range jobStatus.ReplicaStatuses {
+				jobStatus.ReplicaStatuses[rtype].Succeeded += jobStatus.ReplicaStatuses[rtype].Active
+				jobStatus.ReplicaStatuses[rtype].Active = 0
+			}
+		}
+
+		// No need to update the job status if the status hasn't changed since last time.
+		if !reflect.DeepEqual(*oldStatus, jobStatus) {
+			return r.Controller.UpdateJobStatusInApiServer(job, &jobStatus)
+		}
+
+		return nil
+	}
+
+	// retrieve the previous number of retry
+	previousRetry := r.WorkQueue.NumRequeues(jobKey)
+
+	activePods := k8sutil.FilterActivePods(pods)
+
+	r.recordAbnormalPods(activePods, runtimeObject)
+
+	active := int32(len(activePods))
+	failed := k8sutil.FilterPodCount(pods, v1.PodFailed)
+	totalReplicas := k8sutil.GetTotalReplicas(replicas)
+	prevReplicasFailedNum := k8sutil.GetTotalFailedReplicas(jobStatus.ReplicaStatuses)
+
+	var failureMessage string
+	jobExceedsLimit := false
+	exceedsBackoffLimit := false
+	pastBackoffLimit := false
+
+	if runPolicy.BackoffLimit != nil {
+		jobHasNewFailure := failed > prevReplicasFailedNum
+		// new failures happen when status does not reflect the failures and active
+		// is different than parallelism, otherwise the previous controller loop
+		// failed updating status so even if we pick up failure it is not a new one
+		exceedsBackoffLimit = jobHasNewFailure && (active != totalReplicas) &&
+			(int32(previousRetry)+1 > *runPolicy.BackoffLimit)
+
+		pastBackoffLimit, err = r.PastBackoffLimit(jobName, runPolicy, replicas, pods)
+		if err != nil {
+			return err
+		}
+	}
+
+	if exceedsBackoffLimit || pastBackoffLimit {
+		// check if the number of pod restart exceeds backoff (for restart OnFailure only)
+		// OR if the number of failed jobs increased since the last syncJob
+		jobExceedsLimit = true
+		failureMessage = fmt.Sprintf("Job %s has failed because it has reached the specified backoff limit", jobName)
+	} else if r.PastActiveDeadline(runPolicy, jobStatus) {
+		failureMessage = fmt.Sprintf("Job %s has failed because it was active longer than specified deadline", jobName)
+		jobExceedsLimit = true
+	}
+
+	if jobExceedsLimit {
+		// Set job completion time before resource cleanup
+		if jobStatus.CompletionTime == nil {
+			now := metav1.Now()
+			jobStatus.CompletionTime = &now
+		}
+
+		// If the Job exceeds backoff limit or is past active deadline
+		// delete all pods and services, then set the status to failed
+		if err := r.DeletePodsAndServices(runPolicy, job, pods); err != nil {
+			return err
+		}
+
+		if err := r.CleanupJob(runPolicy, jobStatus, job); err != nil {
+			return err
+		}
+
+		if r.Config.EnableGangScheduling {
+			r.Recorder.Event(runtimeObject, v1.EventTypeNormal, "JobTerminated", "Job has been terminated. Deleting PodGroup")
+			if err := r.DeletePodGroup(metaObject); err != nil {
+				r.Recorder.Eventf(runtimeObject, v1.EventTypeWarning, "FailedDeletePodGroup", "Error deleting: %v", err)
+				return err
+			} else {
+				r.Recorder.Eventf(runtimeObject, v1.EventTypeNormal, "SuccessfulDeletePodGroup", "Deleted PodGroup: %v", jobName)
+			}
+		}
+
+		r.Recorder.Event(runtimeObject, v1.EventTypeNormal, commonutil.JobFailedReason, failureMessage)
+
+		if err := commonutil.UpdateJobConditions(&jobStatus, commonv1.JobFailed, commonutil.JobFailedReason, failureMessage); err != nil {
+			logrus.Infof("Append job condition error: %v", err)
+			return err
+		}
+
+		return r.Controller.UpdateJobStatusInApiServer(job, &jobStatus)
+	} else {
+		// General cases which need to reconcile
+		if r.Config.EnableGangScheduling {
+			minMember := totalReplicas
+			queue := ""
+			priorityClass := ""
+			var minResources *v1.ResourceList
+
+			if runPolicy.SchedulingPolicy != nil {
+				if runPolicy.SchedulingPolicy.MinAvailable != nil {
+					minMember = *runPolicy.SchedulingPolicy.MinAvailable
+				}
+
+				if runPolicy.SchedulingPolicy.Queue != "" {
+					queue = runPolicy.SchedulingPolicy.Queue
+				}
+
+				if runPolicy.SchedulingPolicy.PriorityClass != "" {
+					priorityClass = runPolicy.SchedulingPolicy.PriorityClass
+				}
+
+				if runPolicy.SchedulingPolicy.MinResources != nil {
+					minResources = runPolicy.SchedulingPolicy.MinResources
+				}
+			}
+
+			if minResources == nil {
+				minResources = r.calcPGMinResources(minMember, replicas)
+			}
+
+			pgSpec := v1beta1.PodGroupSpec{
+				MinMember:         minMember,
+				Queue:             queue,
+				PriorityClassName: priorityClass,
+				MinResources:      minResources,
+			}
+
+			_, err := r.SyncPodGroup(metaObject, pgSpec)
+			if err != nil {
+				logrus.Warnf("Sync PodGroup %v: %v", jobKey, err)
+			}
+		}
+		ctx := context.WithValue(context.Background(), util.ContextHostNetworkPorts, make(map[string]int32))
+		// Diff current active pods/services with replicas.
+		// for first loop generate host port if need
+		for rtype, spec := range replicas {
+
+			err = r.ReconcileServicesCustom(ctx, metaObject, services, rtype, spec)
+
+			if err != nil {
+				logrus.Warnf("ReconcileServices error %v", err)
+				return err
+			}
+		}
+
+		for rtype, spec := range replicas {
+			err := r.ReconcilePodsCustom(ctx, metaObject, &jobStatus, pods, rtype, spec, replicas)
+			if err != nil {
+				logrus.Warnf("ReconcilePods error %v", err)
+				return err
+			}
+		}
+	}
+
+	err = r.Controller.UpdateJobStatus(job, replicas, &jobStatus)
+	if err != nil {
+		logrus.Warnf("UpdateJobStatus error %v", err)
+		return err
+	}
+	// No need to update the job status if the status hasn't changed since last time.
+	if !reflect.DeepEqual(*oldStatus, jobStatus) {
+		return r.Controller.UpdateJobStatusInApiServer(job, &jobStatus)
+	}
+	return nil
+}
+
+// reconcileServices checks and updates services for each given ReplicaSpec.
+// It will requeue the job in case of an error while creating/deleting services.
+func (r *TFJobReconciler) ReconcileServicesCustom(
+	ctx context.Context,
+	job metav1.Object,
+	services []*v1.Service,
+	rtype commonv1.ReplicaType,
+	spec *commonv1.ReplicaSpec) error {
+
+	// Convert ReplicaType to lower string.
+	rt := strings.ToLower(string(rtype))
+	replicas := int(*spec.Replicas)
+	// Get all services for the type rt.
+	services, err := r.FilterServicesForReplicaType(services, rt)
+	if err != nil {
+		return err
+	}
+
+	// GetServiceSlices will return enough information here to make decision to add/remove/update resources.
+	//
+	// For example, let's assume we have services with replica-index 0, 1, 2
+	// If replica is 4, return a slice with size 4. [[0],[1],[2],[]], a svc with replica-index 3 will be created.
+	//
+	// If replica is 1, return a slice with size 3. [[0],[1],[2]], svc with replica-index 1 and 2 are out of range and will be deleted.
+	serviceSlices := r.GetServiceSlices(services, replicas, commonutil.LoggerForReplica(job, rt))
+
+	for index, serviceSlice := range serviceSlices {
+		if len(serviceSlice) > 1 {
+			commonutil.LoggerForReplica(job, rt).Warningf("We have too many services for %s %d", rt, index)
+		} else if len(serviceSlice) == 0 {
+			commonutil.LoggerForReplica(job, rt).Infof("need to create new service: %s-%d", rt, index)
+			err = r.CreateNewServiceCustom(ctx, job, rtype, spec, strconv.Itoa(index))
+			if err != nil {
+				return err
+			}
+		} else {
+			// Check the status of the current svc.
+			svc := serviceSlice[0]
+
+			hostPort, ok := util.GetHostNetworkPortFromContext(ctx, rt, strconv.Itoa(index))
+			if ok && len(svc.Spec.Ports) > 0 && svc.Spec.Ports[0].TargetPort.IntVal != hostPort {
+				commonutil.LoggerForReplica(job, rt).Infof("update target service: %s-%d, new port: %d",
+					rt, index, hostPort)
+				// Update service target port to latest container host port, because replicas may fail-over
+				// and its host port changed, so we'd ensure that other replicas can reach it with correct
+				// target port.
+				newService := svc.DeepCopy()
+				newService.Spec.Ports[0].TargetPort = intstr.FromInt(int(hostPort))
+				err = r.patchService(svc, newService)
+				if err != nil {
+					return err
+				}
+			}
+			// check if the index is in the valid range, if not, we should kill the svc
+			if index < 0 || index >= replicas {
+				err = r.ServiceControl.DeleteService(svc.Namespace, svc.Name, job.(runtime.Object))
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (r *TFJobReconciler) calcPGMinResources(minMember int32, replicas map[commonv1.ReplicaType]*commonv1.ReplicaSpec) *v1.ResourceList {
+	var replicasPriority ReplicasPriority
+	for t, replica := range replicas {
+		rp := ReplicaPriority{0, *replica}
+		pc := replica.Template.Spec.PriorityClassName
+
+		priorityClass, err := r.PriorityClassLister.Get(pc)
+		if err != nil || priorityClass == nil {
+			logrus.Warnf("Ignore task %s priority class %s: %v", t, pc, err)
+		} else {
+			rp.priority = priorityClass.Value
+		}
+
+		replicasPriority = append(replicasPriority, rp)
+	}
+
+	sort.Sort(replicasPriority)
+
+	minAvailableTasksRes := v1.ResourceList{}
+	podCnt := int32(0)
+	for _, task := range replicasPriority {
+		if task.Replicas == nil {
+			continue
+		}
+
+		for i := int32(0); i < *task.Replicas; i++ {
+			if podCnt >= minMember {
+				break
+			}
+			podCnt++
+			for _, c := range task.Template.Spec.Containers {
+				AddResourceList(minAvailableTasksRes, c.Resources.Requests, c.Resources.Limits)
+			}
+		}
+	}
+
+	return &minAvailableTasksRes
+}
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -375,7 +781,7 @@ func (r *TFJobReconciler) DeleteJob(job interface{}) error {
 	}
 
 	r.recorder.Eventf(tfJob, v1.EventTypeNormal, SuccessfulDeleteJobReason, "Deleted job: %v", tfJob.Name)
-	log.Infof("job %s/%s has been deleted", tfJob.Namespace, tfJob.Name)
+	logrus.Infof("job %s/%s has been deleted", tfJob.Namespace, tfJob.Name)
 	trainingoperatorcommon.DeletedJobsCounterInc(tfJob.Namespace, tensorflowv1.FrameworkName)
 	return nil
 }
@@ -569,7 +975,7 @@ func (r *TFJobReconciler) UpdateJobStatusInApiServer(job interface{}, jobStatus 
 }
 
 // Same as Func (tc *TFController) SetClusterSpec(...) in pod.go
-func (r *TFJobReconciler) SetClusterSpec(job interface{}, podTemplate *corev1.PodTemplateSpec, rtype, index string) error {
+func (r *TFJobReconciler) SetClusterSpecCustom(ctx context.Context, job interface{}, podTemplate *corev1.PodTemplateSpec, rtype, index string) error {
 	tfjob, ok := job.(*tensorflowv1.TFJob)
 	if !ok {
 		return fmt.Errorf("%v is not a type of TFJob", tfjob)
@@ -580,7 +986,7 @@ func (r *TFJobReconciler) SetClusterSpec(job interface{}, podTemplate *corev1.Po
 		return nil
 	}
 	// Generate TF_CONFIG JSON string.
-	tfConfigStr, err := genTFConfigJSONStr(tfjob, rtype, index)
+	tfConfigStr, err := genTFConfigJSONStr(ctx, tfjob, rtype, index)
 	if err != nil {
 		return err
 	}
@@ -601,6 +1007,10 @@ func (r *TFJobReconciler) SetClusterSpec(job interface{}, podTemplate *corev1.Po
 			break
 		}
 	}
+	return nil
+}
+
+func (r *TFJobReconciler) SetClusterSpec(job interface{}, podTemplate *corev1.PodTemplateSpec, rtype, index string) error {
 	return nil
 }
 
@@ -669,7 +1079,8 @@ func (r *TFJobReconciler) getPodSlices(tfjob *tensorflowv1.TFJob, replicasNum *i
 // This should be removed later unless TF has specific logics there
 // reconcilePods checks and updates pods for each given TFReplicaSpec.
 // It will requeue the tfjob in case of an error while creating/deleting pods.
-func (r *TFJobReconciler) ReconcilePods(
+func (r *TFJobReconciler) ReconcilePodsCustom(
+	ctx context.Context,
 	job interface{},
 	jobStatus *commonv1.JobStatus,
 	pods []*v1.Pod,
@@ -714,7 +1125,7 @@ func (r *TFJobReconciler) ReconcilePods(
 			// check if this replica is the master role
 			masterRole = r.IsMasterRole(replicas, rtype, index)
 			// TODO: [should change to CreateNewPod]
-			err = r.createNewPod(tfJob, rt, strconv.Itoa(index), spec, masterRole, replicas)
+			err = r.createNewPod(ctx, tfJob, rt, strconv.Itoa(index), spec, masterRole, replicas)
 			if err != nil {
 				return err
 			}
@@ -739,6 +1150,13 @@ func (r *TFJobReconciler) ReconcilePods(
 					r.Recorder.Eventf(tfJob, v1.EventTypeNormal, exitedWithCodeReason, "Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
 				}
 			}
+			// Get and pass its container port by context if pod enables hostnetwork mode.
+			if util.EnableHostNetwork(tfJob) {
+				port := util.GetContainerHostNetworkPort(pod, r.Controller.GetDefaultContainerName(), r.Controller.GetDefaultContainerPortName())
+				logger.Debugf("## HostPort Set to Context: %v.%v ", pod.Name, port)
+				util.StoreHostNetworkPortToContext(ctx, rt, strconv.Itoa(index), port)
+			}
+
 			// Check if the pod is retryable.
 			if spec.RestartPolicy == commonv1.RestartPolicyExitCode {
 				if pod.Status.Phase == v1.PodFailed && train_util.IsRetryableExitCode(exitCode) {
@@ -768,7 +1186,7 @@ func (r *TFJobReconciler) ReconcilePods(
 }
 
 // createNewPod creates a new pod for the given index and type.
-func (r *TFJobReconciler) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec *commonv1.ReplicaSpec, masterRole bool,
+func (r *TFJobReconciler) createNewPod(ctx context.Context, tfjob *tfv1.TFJob, rt, index string, spec *commonv1.ReplicaSpec, masterRole bool,
 	replicas map[commonv1.ReplicaType]*commonv1.ReplicaSpec) error {
 
 	tfjobKey, err := common.KeyFunc(tfjob)
@@ -789,12 +1207,19 @@ func (r *TFJobReconciler) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec
 	labels := r.GenLabels(tfjob.Name)
 	labels[tfReplicaTypeLabel] = rt
 	labels[tfReplicaIndexLabel] = index
+	podTemplate := spec.Template.DeepCopy()
 
 	if masterRole {
 		labels[commonv1.JobRoleLabel] = "master"
 	}
+	if util.EnableHostNetwork(tfjob) {
+		commonutil.LoggerForReplica(tfjob, rt).Infof("pod enable host network, name: %s, masterRole: %v",
+			tfjob.GetName(), masterRole)
+		if err := r.setupHostNetwork(ctx, podTemplate, rt, index); err != nil {
+			return err
+		}
 
-	podTemplate := spec.Template.DeepCopy()
+	}
 
 	// Set name for the template.
 	podTemplate.Name = common.GenGeneralName(tfjob.Name, rt, index)
@@ -807,7 +1232,7 @@ func (r *TFJobReconciler) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec
 		podTemplate.Labels[key] = value
 	}
 
-	if err := r.SetClusterSpec(tfjob, podTemplate, rt, index); err != nil {
+	if err := r.SetClusterSpecCustom(ctx, tfjob, podTemplate, rt, index); err != nil {
 		return err
 	}
 
@@ -824,12 +1249,13 @@ func (r *TFJobReconciler) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec
 	// 1. if user has specified other scheduler, we report a warning without overriding any fields.
 	// 2. if no SchedulerName is set for pods, then we set the SchedulerName to "volcano".
 	if r.Config.EnableGangScheduling {
-		if util.IsGangSchedulerSet(replicas, gangSchedulerName) {
+		podSchedulerName := util.GetSchedulerName(replicas)
+		if len(podSchedulerName) == 0 {
+			podTemplate.Spec.SchedulerName = gangSchedulerName
+		} else if strings.Compare(podSchedulerName, gangSchedulerName) != 0 {
 			errMsg := "Another scheduler is specified when gang-scheduling is enabled and it will not be overwritten"
 			logger.Warning(errMsg)
 			r.Recorder.Event(tfjob, v1.EventTypeWarning, podTemplateSchedulerNameReason, errMsg)
-		} else {
-			podTemplate.Spec.SchedulerName = gangSchedulerName
 		}
 
 		if podTemplate.Annotations == nil {
@@ -860,6 +1286,45 @@ func (r *TFJobReconciler) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec
 	return nil
 }
 
+func (r *TFJobReconciler) setupHostNetworkOrigin(ctx context.Context, spec *v1.PodTemplateSpec, rtype, index string) error {
+	const (
+		randomPortLowerBound = 20001
+		randomPortUpperBound = 65535
+	)
+	// 先设置第一个节点
+	port := int32(rand.IntnRange(randomPortLowerBound, randomPortUpperBound))
+	// 1) enable pod hostNetwork mode.
+	spec.Spec.HostNetwork = true
+	// 2) [CRITICAL] setup dns policy with hostnetwork instead of ClusterFirst by default.
+	spec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
+	// 3) setup container port with a random port ranged [20001, 65535).
+	util.SetupContainerHostNetworkPort(spec, r.Controller.GetDefaultContainerName(), r.Controller.GetDefaultContainerPortName(), port)
+	// 4) record selected port by context keyed with replica-index.
+	util.StoreHostNetworkPortToContext(ctx, rtype, index, port)
+
+	return nil
+}
+
+func (r *TFJobReconciler) setupHostNetwork(ctx context.Context, spec *v1.PodTemplateSpec, rtype, index string) error {
+
+	// 先设置第一个节点
+	port, ok := util.GetHostNetworkPortFromContext(ctx, rtype, index)
+	if !ok {
+		logrus.Warnf("Can't get hostport from context: %v-%v", rtype, index)
+		return nil
+	}
+	// 1) enable pod hostNetwork mode.
+	spec.Spec.HostNetwork = true
+	// 2) [CRITICAL] setup dns policy with hostnetwork instead of ClusterFirst by default.
+	spec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
+	// 3) setup container port with a random port ranged [20001, 65535).
+	util.SetupContainerHostNetworkPort(spec, r.Controller.GetDefaultContainerName(), r.Controller.GetDefaultContainerPortName(), port)
+	// 4) record selected port by context keyed with replica-index.
+	util.StoreHostNetworkPortToContext(ctx, rtype, index, port)
+
+	return nil
+}
+
 // onOwnerCreateFunc modify creation condition.
 func (r *TFJobReconciler) onOwnerCreateFunc() func(event.CreateEvent) bool {
 	return func(e event.CreateEvent) bool {
@@ -878,4 +1343,94 @@ func (r *TFJobReconciler) onOwnerCreateFunc() func(event.CreateEvent) bool {
 		}
 		return true
 	}
+}
+
+// createNewService creates a new service for the given index and type.
+func (r *TFJobReconciler) CreateNewServiceCustom(ctx context.Context, job metav1.Object, rtype commonv1.ReplicaType,
+	spec *commonv1.ReplicaSpec, index string) error {
+	const (
+		randomPortLowerBound = 20001
+		randomPortUpperBound = 65535
+	)
+
+	jobKey, err := KeyFunc(job)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for job object %#v: %v", job, err))
+		return err
+	}
+
+	// Convert ReplicaType to lower string.
+	rt := strings.ToLower(string(rtype))
+
+	// Append ReplicaTypeLabel and ReplicaIndexLabel labels.
+	labels := r.GenLabels(job.GetName())
+	labels[commonv1.ReplicaTypeLabel] = rt
+	labels[commonv1.ReplicaIndexLabel] = index
+
+	ports, err := r.GetPortsFromJob(spec)
+	if err != nil {
+		return err
+	}
+	clusterIP := "None"
+
+	service := &v1.Service{
+		Spec: v1.ServiceSpec{
+			ClusterIP: clusterIP,
+			Selector:  labels,
+			Ports:     []v1.ServicePort{},
+		},
+	}
+
+	// Add service ports to headless service
+	for name, port := range ports {
+		if name == r.GetDefaultContainerPortName() && util.EnableHostNetwork(job) {
+			// 先创建svc svc的loop中生成hostPort
+			newHostPort := int32(rand.IntnRange(randomPortLowerBound, randomPortUpperBound))
+			logrus.Infof("genrating hostPort Here: %v", newHostPort)
+			util.StoreHostNetworkPortToContext(ctx, rt, index, newHostPort)
+			svcPort := v1.ServicePort{Name: name, Port: newHostPort}
+			service.Spec.Ports = append(service.Spec.Ports, svcPort)
+
+		} else {
+			svcPort := v1.ServicePort{Name: name, Port: port}
+			service.Spec.Ports = append(service.Spec.Ports, svcPort)
+
+		}
+	}
+
+	service.Name = GenGeneralName(job.GetName(), rt, index)
+	service.Labels = labels
+	// Create OwnerReference.
+	controllerRef := r.GenOwnerReference(job)
+
+	// Creation is expected when there is no error returned
+	expectationServicesKey := expectation.GenExpectationServicesKey(jobKey, rt)
+	r.Expectations.RaiseExpectations(expectationServicesKey, 1, 0)
+
+	err = r.ServiceControl.CreateServicesWithControllerRef(job.GetNamespace(), service, job.(runtime.Object), controllerRef)
+	if err != nil && errors.IsTimeout(err) {
+		// Service is created but its initialization has timed out.
+		// If the initialization is successful eventually, the
+		// controller will observe the creation via the informer.
+		// If the initialization fails, or if the service keeps
+		// uninitialized for a long time, the informer will not
+		// receive any update, and the controller will create a new
+		// service when the expectation expires.
+		succeededServiceCreationCount.Inc()
+		return nil
+	} else if err != nil {
+		// Since error occurred(the informer won't observe this service),
+		// we decrement the expected number of creates
+		// and wait until next reconciliation
+		r.Expectations.CreationObserved(expectationServicesKey)
+		failedServiceCreationCount.Inc()
+		return err
+	}
+	succeededServiceCreationCount.Inc()
+	return nil
+}
+func (r *TFJobReconciler) patchService(oldObj, newObj *v1.Service) error {
+	// deepcopy new object avoid of in-memory modifications being override by in-cluster object.
+	newPatchObj := newObj.DeepCopyObject()
+	return r.Client.Patch(context.Background(), newPatchObj.(*v1.Service), client.MergeFrom(oldObj))
 }

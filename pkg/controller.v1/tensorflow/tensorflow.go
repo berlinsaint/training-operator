@@ -16,8 +16,11 @@
 package tensorflow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	commonutil "github.com/kubeflow/common/pkg/util"
+	"github.com/kubeflow/training-operator/pkg/common/util"
 	"os"
 	"strconv"
 	"strings"
@@ -94,14 +97,14 @@ func convertClusterSpecToSparseClusterSpec(clusterSpec ClusterSpec, rtype string
 //         },
 //     }
 // }
-func genTFConfigJSONStr(tfjob *tfv1.TFJob, rtype, index string) (string, error) {
+func genTFConfigJSONStr(ctx context.Context, tfjob *tfv1.TFJob, rtype, index string) (string, error) {
 	// Configure the TFCONFIG environment variable.
 	i, err := strconv.ParseInt(index, 0, 32)
 	if err != nil {
 		return "", err
 	}
 
-	cluster, err := genClusterSpec(tfjob)
+	cluster, err := genClusterSpec(ctx, tfjob, rtype, index)
 	if err != nil {
 		return "", err
 	}
@@ -139,7 +142,7 @@ func genTFConfigJSONStr(tfjob *tfv1.TFJob, rtype, index string) (string, error) 
 }
 
 // genClusterSpec will generate ClusterSpec.
-func genClusterSpec(tfjob *tfv1.TFJob) (ClusterSpec, error) {
+func genClusterSpec(ctx context.Context, tfjob *tfv1.TFJob, selfType, selfIndex string) (ClusterSpec, error) {
 	clusterSpec := make(ClusterSpec)
 
 	for rtype, spec := range tfjob.Spec.TFReplicaSpecs {
@@ -161,8 +164,20 @@ func genClusterSpec(tfjob *tfv1.TFJob) (ClusterSpec, error) {
 			if len(clusterDomain) > 0 {
 				svcName += "." + clusterDomain
 			}
+			selfPort := port
+			// Set endpoint port as selected hostnetwork port so that tensorflow worker process could listen
+			// to correct port by TF_CONFIG[cluster].
+			if util.EnableHostNetwork(tfjob) && rt == selfType {
+				hostPort, ok := util.GetHostNetworkPortFromContext(ctx, selfType, strconv.Itoa(int(i)))
+				if ok {
+					commonutil.LoggerForJob(tfjob).Warnf("getHostPort: %v", hostPort)
+					selfPort = hostPort
+				} else {
+					commonutil.LoggerForJob(tfjob).Warnf("getHostPort: %v", selfPort)
 
-			endpoint := fmt.Sprintf("%s:%d", svcName, port)
+				}
+			}
+			endpoint := fmt.Sprintf("%s:%d", svcName, selfPort)
 			replicaNames = append(replicaNames, endpoint)
 		}
 
